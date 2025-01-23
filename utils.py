@@ -429,56 +429,95 @@ def identify_audio_format(file_bytes):
 
 import asyncio
 import time as time_module
+async def check_response_content(content, channel_id, engine, stream, error_triggers):
+    """检查响应内容并处理可能的错误
+
+    Args:
+        content: 需要检查的响应内容
+        channel_id: 提供者ID
+        engine: 引擎类型
+        stream: 是否为流式响应
+        error_triggers: 错误触发词列表
+
+    Raises:
+        StopAsyncIteration: 当检测到需要停止的情况
+        HTTPException: 当检测到HTTP错误
+    """
+    if isinstance(content, (bytes, bytearray)):
+        if identify_audio_format(content) in ["MP3", "MP3 with ID3", "OPUS", "AAC (ADIF)", "AAC (ADTS)", "FLAC", "WAV"]:
+            return content, True
+        content = content.decode("utf-8")
+
+    if isinstance(content, str):
+        if content.startswith("data:"):
+            content = content.lstrip("data: ")
+        if content.startswith("[DONE]"):
+            logger.error(f"provider: {channel_id:<11} error_handling_wrapper [DONE]!")
+            raise StopAsyncIteration
+        try:
+            encode_content = content.encode().decode('unicode-escape')
+        except UnicodeDecodeError:
+            encode_content = content
+            logger.error(f"provider: {channel_id:<11} error UnicodeDecodeError: %s", content)
+        if any(x in encode_content for x in error_triggers):
+            logger.error(f"provider: {channel_id:<11} error const string: %s", encode_content)
+            raise StopAsyncIteration
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            if "uni-api-heartbeat" not in content:
+                logger.error(f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(content)}")
+                raise StopAsyncIteration
+
+    if isinstance(content, dict):
+        if 'error' in content and content.get('error') != {"message": "","type": "","param": "","code": None}:
+            status_code = content.get('status_code', 500)
+            detail = content.get('details', f"{content}")
+            raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
+
+        if engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
+            if any(x in str(content) for x in error_triggers):
+                logger.error(f"provider: {channel_id:<11} error const string: %s", content)
+                raise StopAsyncIteration
+            message_content = safe_get(content, "choices", 0, "message", "content", default=None)
+            if message_content == "" or message_content is None:
+                raise StopAsyncIteration
+
+    return content, False
+
 async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers):
     start_time = time_module.time()
     try:
+        # 获取第一个响应，可能是心跳或实际响应
         first_item = await generator.__anext__()
         first_response_time = time_module.time() - start_time
-        first_item_str = first_item
-        # logger.info("first_item_str: %s :%s", type(first_item_str), first_item_str)
-        if isinstance(first_item_str, (bytes, bytearray)):
-            if identify_audio_format(first_item_str) in ["MP3", "MP3 with ID3", "OPUS", "AAC (ADIF)", "AAC (ADTS)", "FLAC", "WAV"]:
-                return first_item, first_response_time
-            else:
-                first_item_str = first_item_str.decode("utf-8")
-        if isinstance(first_item_str, str):
-            if first_item_str.startswith("data:"):
-                first_item_str = first_item_str.lstrip("data: ")
-            if first_item_str.startswith("[DONE]"):
-                logger.error(f"provider: {channel_id:<11} error_handling_wrapper [DONE]!")
-                raise StopAsyncIteration
-            try:
-                encode_first_item_str = first_item_str.encode().decode('unicode-escape')
-            except UnicodeDecodeError:
-                encode_first_item_str = first_item_str
-                logger.error(f"provider: {channel_id:<11} error UnicodeDecodeError: %s", first_item_str)
-            if any(x in encode_first_item_str for x in error_triggers):
-                logger.error(f"provider: {channel_id:<11} error const string: %s", encode_first_item_str)
-                raise StopAsyncIteration
-            try:
-                first_item_str = json.loads(first_item_str)
-            except json.JSONDecodeError:
-                if "uni-api-heartbeat" not in first_item_str:
-                    logger.error(f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(first_item_str)}")
-                    raise StopAsyncIteration
-        if isinstance(first_item_str, dict) and 'error' in first_item_str and first_item_str.get('error') != {"message": "","type": "","param": "","code": None}:
-            # 如果第一个 yield 的项是错误信息，抛出 HTTPException
-            status_code = first_item_str.get('status_code', 500)
-            detail = first_item_str.get('details', f"{first_item_str}")
-            raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
 
-        if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
-            if any(x in str(first_item_str) for x in error_triggers):
-                logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
-                raise StopAsyncIteration
-            content = safe_get(first_item_str, "choices", 0, "message", "content", default=None)
-            if content == "" or content is None:
-                raise StopAsyncIteration
+        # 如果是心跳消息，创建一个新的生成器来处理所有消息
+        if first_item.startswith(": uni-api-heartbeat"):
+            async def new_generator():
+                yield first_item  # 返回心跳
+                first_real_response = None
+                async for item in generator:
+                    if not first_real_response and not item.startswith(": uni-api-heartbeat"):
+                        # 对第一个实际响应进行错误检查
+                        first_real_response = item
+                        checked_content, is_audio = await check_response_content(first_real_response, channel_id, engine, stream, error_triggers)
+                        if is_audio:
+                            yield checked_content
+                            continue
+                        yield ensure_string(first_real_response)
+                    else:
+                        yield ensure_string(item)
+
+            return new_generator(), first_response_time
+
+        # 如果第一个就是实际响应，进行检查
+        checked_content, is_audio = await check_response_content(first_item, channel_id, engine, stream, error_triggers)
+        if is_audio:
+            return checked_content, first_response_time
 
         # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
         async def new_generator():
-            # print("type(first_item)", type(first_item))
-            # print("first_item", ensure_string(first_item))
             yield ensure_string(first_item)
             try:
                 async for item in generator:

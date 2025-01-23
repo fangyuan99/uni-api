@@ -443,23 +443,23 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
                 )
 
                 for task in done:
-                    try:
-                        result = await task
-                        if task == response_task:
-                            response_task = None
-                            yield result
-                            if "[DONE]" in result:
-                                return
-                        else:  # heartbeat task
-                            heartbeat_task = None
-                            yield result
+                    # try:
+                    result = await task
+                    if task == response_task:
+                        response_task = None
+                        yield result
+                        if "[DONE]" in result:
+                            return
+                    else:  # heartbeat task
+                        heartbeat_task = None
+                        yield result
 
-                    except StopAsyncIteration:
-                        return
-                    except Exception as e:
-                        logger.error(f"Error in fetch_response_stream: {str(e)}")
-                        yield {"error": "500", "details": f"fetch_response_stream error: {str(e)}"}
-                        return
+                    # except StopAsyncIteration:
+                    #     return
+                    # except Exception as e:
+                    #     logger.error(f"Error in fetch_response_stream: {str(e)}")
+                    #     yield {"error": "500", "details": f"fetch_response_stream error: {str(e)}"}
+                    #     return
 
         finally:
             # 清理任务
