@@ -453,17 +453,41 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
                         heartbeat_task = None
                         yield result
 
+        except GeneratorExit:
+            # 当生成器被关闭时，确保所有任务都被正确清理
+            if response_task:
+                response_task.cancel()
+                try:
+                    await response_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+            raise
+
         finally:
             # 清理任务
             if response_task:
                 response_task.cancel()
+                try:
+                    await response_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
             if heartbeat_task:
                 heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
             # 清理异步生成器
             if response_gen is not None:
                 try:
                     await response_gen.aclose()
-                except (asyncio.CancelledError, RuntimeError) as e:
+                except (asyncio.CancelledError, RuntimeError, StopAsyncIteration) as e:
                     # 忽略已经运行或已经关闭的生成器错误
                     pass
                 except Exception as e:
