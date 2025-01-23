@@ -493,12 +493,12 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         first_response_time = time_module.time() - start_time
 
         # 如果是心跳消息，创建一个新的生成器来处理所有消息
-        if first_item.startswith(": uni-api-heartbeat"):
+        if str(first_item).startswith(": uni-api-heartbeat"):
             async def new_generator():
                 yield first_item  # 返回心跳
                 first_real_response = None
                 async for item in generator:
-                    if not first_real_response and not item.startswith(": uni-api-heartbeat"):
+                    if not first_real_response and not str(item).startswith(": uni-api-heartbeat"):
                         # 对第一个实际响应进行错误检查
                         first_real_response = item
                         checked_content, is_audio = await check_response_content(first_real_response, channel_id, engine, stream, error_triggers)
