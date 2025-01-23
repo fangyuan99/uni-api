@@ -3,10 +3,45 @@ import httpx
 import random
 import string
 from datetime import datetime
+import asyncio
+from contextlib import asynccontextmanager
 
 from log_config import logger
 
 from utils import safe_get, generate_sse_response, generate_no_stream_response, end_of_line
+
+@asynccontextmanager
+async def heartbeat_generator(interval=30):
+    """
+    创建一个异步心跳生成器，每隔指定的间隔时间发送一个心跳信号。
+
+    Args:
+        interval (int): 心跳信号的间隔时间（秒），默认为30秒
+
+    Yields:
+        asyncio.Queue: 用于接收心跳信号的队列
+    """
+    queue = asyncio.Queue()
+    heartbeat_task = None
+
+    async def send_heartbeat():
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await queue.put(f": uni-api-heartbeat{end_of_line}")
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        heartbeat_task = asyncio.create_task(send_heartbeat())
+        yield queue
+    finally:
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
 async def check_response(response, error_log):
     if response and not (200 <= response.status_code < 300):
@@ -136,7 +171,6 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         yield "data: [DONE]" + end_of_line
 
 async def fetch_gpt_response_stream(client, url, headers, payload):
-    yield ": heartbeat" + end_of_line
     timestamp = int(datetime.timestamp(datetime.now()))
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -373,31 +407,69 @@ async def fetch_response(client, url, headers, payload, engine, model):
         yield response_json
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
-    # try:
-    if engine == "gemini" or engine == "vertex-gemini":
-        async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
-            yield chunk
-    elif engine == "claude" or engine == "vertex-claude":
-        async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
-            yield chunk
-    elif engine == "gpt":
-        async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
-            yield chunk
-    elif engine == "azure":
-        async for chunk in fetch_azure_response_stream(client, url, headers, payload):
-            yield chunk
-    elif engine == "openrouter":
-        async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
-            yield chunk
-    elif engine == "cloudflare":
-        async for chunk in fetch_cloudflare_response_stream(client, url, headers, payload, model):
-            yield chunk
-    elif engine == "cohere":
-        async for chunk in fetch_cohere_response_stream(client, url, headers, payload, model):
-            yield chunk
-    else:
-        raise ValueError("Unknown response")
-    # except httpx.ConnectError as e:
-    #     yield {"error": f"500", "details": "fetch_response_stream Connect Error"}
-    # except httpx.ReadTimeout as e:
-    #     yield {"error": f"500", "details": "fetch_response_stream Read Response Timeout"}
+    response_gen = None
+    async with heartbeat_generator() as heartbeat_queue:
+        response_task = None
+        heartbeat_task = None
+
+        try:
+            if engine == "gemini" or engine == "vertex-gemini":
+                response_gen = fetch_gemini_response_stream(client, url, headers, payload, model)
+            elif engine == "claude" or engine == "vertex-claude":
+                response_gen = fetch_claude_response_stream(client, url, headers, payload, model)
+            elif engine == "gpt":
+                response_gen = fetch_gpt_response_stream(client, url, headers, payload)
+            elif engine == "azure":
+                response_gen = fetch_azure_response_stream(client, url, headers, payload)
+            elif engine == "openrouter":
+                response_gen = fetch_gpt_response_stream(client, url, headers, payload)
+            elif engine == "cloudflare":
+                response_gen = fetch_cloudflare_response_stream(client, url, headers, payload, model)
+            elif engine == "cohere":
+                response_gen = fetch_cohere_response_stream(client, url, headers, payload, model)
+            else:
+                raise ValueError("Unknown response")
+
+            while True:
+                # 创建新任务
+                if response_task is None:
+                    response_task = asyncio.create_task(response_gen.__anext__())
+                if heartbeat_task is None:
+                    heartbeat_task = asyncio.create_task(heartbeat_queue.get())
+
+                done, pending = await asyncio.wait(
+                    [response_task, heartbeat_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for task in done:
+                    try:
+                        result = await task
+                        if task == response_task:
+                            response_task = None
+                            yield result
+                            if "[DONE]" in result:
+                                return
+                        else:  # heartbeat task
+                            heartbeat_task = None
+                            yield result
+
+                    except StopAsyncIteration:
+                        return
+                    except Exception as e:
+                        logger.error(f"Error in fetch_response_stream: {str(e)}")
+                        yield {"error": "500", "details": f"fetch_response_stream error: {str(e)}"}
+                        return
+
+        finally:
+            # 清理任务
+            if response_task:
+                response_task.cancel()
+            if heartbeat_task:
+                heartbeat_task.cancel()
+            # 清理异步生成器
+            if response_gen is not None:
+                try:
+                    await response_gen.aclose()
+                except Exception as e:
+                    logger.error(f"Error closing response generator: {str(e)}")
