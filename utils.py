@@ -458,8 +458,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             try:
                 first_item_str = json.loads(first_item_str)
             except json.JSONDecodeError:
-                logger.error(f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(first_item_str)}")
-                raise StopAsyncIteration
+                if not first_item_str.startswith(": heartbeat"):
+                    logger.error(f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(first_item_str)}")
+                    raise StopAsyncIteration
         if isinstance(first_item_str, dict) and 'error' in first_item_str and first_item_str.get('error') != {"message": "","type": "","param": "","code": None}:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             status_code = first_item_str.get('status_code', 500)
