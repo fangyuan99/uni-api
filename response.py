@@ -10,39 +10,6 @@ from log_config import logger
 
 from utils import safe_get, generate_sse_response, generate_no_stream_response, end_of_line
 
-@asynccontextmanager
-async def heartbeat_generator(interval=30):
-    """
-    创建一个异步心跳生成器，每隔指定的间隔时间发送一个心跳信号。
-
-    Args:
-        interval (int): 心跳信号的间隔时间（秒），默认为30秒
-
-    Yields:
-        asyncio.Queue: 用于接收心跳信号的队列
-    """
-    queue = asyncio.Queue()
-    heartbeat_task = None
-
-    async def send_heartbeat():
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                await queue.put(f": uni-api-heartbeat{end_of_line}")
-        except asyncio.CancelledError:
-            pass
-
-    try:
-        heartbeat_task = asyncio.create_task(send_heartbeat())
-        yield queue
-    finally:
-        if heartbeat_task:
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
-
 async def check_response(response, error_log):
     if response and not (200 <= response.status_code < 300):
         error_message = await response.aread()
@@ -406,6 +373,39 @@ async def fetch_response(client, url, headers, payload, engine, model):
         response_json = response.json()
         yield response_json
 
+@asynccontextmanager
+async def heartbeat_generator(interval=2):
+    """
+    创建一个异步心跳生成器，每隔指定的间隔时间发送一个心跳信号。
+
+    Args:
+        interval (int): 心跳信号的间隔时间（秒），默认为30秒
+
+    Yields:
+        asyncio.Queue: 用于接收心跳信号的队列
+    """
+    queue = asyncio.Queue()
+    heartbeat_task = None
+
+    async def send_heartbeat():
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await queue.put(f": uni-api-heartbeat{end_of_line}")
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        heartbeat_task = asyncio.create_task(send_heartbeat())
+        yield queue
+    finally:
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
 async def fetch_response_stream(client, url, headers, payload, engine, model):
     response_gen = None
     async with heartbeat_generator() as heartbeat_queue:
@@ -471,5 +471,8 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
             if response_gen is not None:
                 try:
                     await response_gen.aclose()
+                except (asyncio.CancelledError, RuntimeError) as e:
+                    # 忽略已经运行或已经关闭的生成器错误
+                    pass
                 except Exception as e:
                     logger.error(f"Error closing response generator: {str(e)}")
