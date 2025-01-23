@@ -136,6 +136,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         yield "data: [DONE]" + end_of_line
 
 async def fetch_gpt_response_stream(client, url, headers, payload):
+    yield ": heartbeat" + end_of_line
     timestamp = int(datetime.timestamp(datetime.now()))
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
