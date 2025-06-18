@@ -179,9 +179,14 @@ providers:
 
   - provider: vertex-express
     base_url: https://aiplatform.googleapis.com/
-    api: xx.xxx
+    project_id:
+      - xxx # project_id of key1
+      - xxx # project_id of key2
+    api:
+      - xx.xxx # api of key1
+      - xx.xxx # api of key2
     model:
-      - gemini-2.5-pro-preview-05-06
+      - gemini-2.5-pro-preview-06-05
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
@@ -276,6 +281,15 @@ yym68686/uni-api:latest
 - DEBUG: Whether to enable debug mode, default is false, optional. When enabled, more logs will be printed, which can be used when submitting issues.
 - TIMEOUT: Request timeout, default is 100 seconds. The timeout can control the time needed to switch to the next channel when one channel does not respond. Optional
 - DISABLE_DATABASE: Whether to disable the database, default is false, optional
+- DB_TYPE: Database type, default is sqlite, optional. Supports sqlite and postgres.
+
+When DB_TYPE is postgres, the following environment variables need to be set:
+
+- DB_USER: Database user name, default is postgres, optional
+- DB_PASSWORD: Database password, default is mysecretpassword, optional
+- DB_HOST: Database host, default is localhost, optional
+- DB_PORT: Database port, default is 5432, optional
+- DB_NAME: Database name, default is postgres, optional
 
 ## Koyeb remote deployment
 
