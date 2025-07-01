@@ -95,12 +95,12 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-2.5-pro-exp-05-06
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash # After renaming, the original model name gemini-2.5-flash-preview-04-17 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
-      - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-exp-05-06: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in post_body_parameter_overrides. Additionally, you can customize the inference budget using -think-number. These options can be used together or separately.
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
+      - gemini-2.5-pro
+      - gemini-2.5-flash: gemini-2.5-flash # After renaming, the original model name gemini-2.5-flash cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
+      - gemini-2.5-flash
+      - gemini-2.5-pro: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
+      - gemini-2.5-flash: gemini-2.5-flash-think-24576-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in post_body_parameter_overrides. Additionally, you can customize the inference budget using -think-number. These options can be used together or separately.
+      - gemini-2.5-flash: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
     tools: true
     preferences:
       api_key_rate_limit: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
@@ -131,9 +131,9 @@ providers:
     private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # Description: Private key for Google Cloud Vertex AI service account. Format: A JSON formatted string containing the private key information of the service account. How to obtain: Create a service account in Google Cloud Console, generate a JSON formatted key file, and then set its content as the value of this environment variable.
     client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to obtain: Generated when creating a service account, or you can view the service account details in the "IAM and Admin" section of the Google Cloud Console.
     model:
-      - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-preview-03-25
-      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`. Not setting post_body_parameter_overrides will not enable search.
+      - gemini-2.5-flash
+      - gemini-2.5-pro
+      - gemini-2.5-pro: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`. Not setting post_body_parameter_overrides will not enable search.
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
@@ -170,6 +170,15 @@ providers:
           include_usage: true # Force the request to add "stream_options": {"include_usage": true} parameter
       cooldown_period: 0 # When cooldown_period is set to 0, the cooling mechanism is not enabled, the priority is higher than the global configuration cooldown_period.
 
+  - provider: databricks
+    base_url: https://xxx.azuredatabricks.net
+    api:
+      - xxx
+    model:
+      - databricks-claude-sonnet-4: claude-sonnet-4
+      - databricks-claude-opus-4: claude-opus-4
+      - databricks-claude-3-7-sonnet: claude-3-7-sonnet
+
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com
     aws_access_key: xxxxxxxx
@@ -179,9 +188,14 @@ providers:
 
   - provider: vertex-express
     base_url: https://aiplatform.googleapis.com/
-    api: xx.xxx
+    project_id:
+      - xxx # project_id of key1
+      - xxx # project_id of key2
+    api:
+      - xx.xxx # api of key1
+      - xx.xxx # api of key2
     model:
-      - gemini-2.5-pro-preview-05-06
+      - gemini-2.5-pro-preview-06-05
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
@@ -276,6 +290,15 @@ yym68686/uni-api:latest
 - DEBUG: Whether to enable debug mode, default is false, optional. When enabled, more logs will be printed, which can be used when submitting issues.
 - TIMEOUT: Request timeout, default is 100 seconds. The timeout can control the time needed to switch to the next channel when one channel does not respond. Optional
 - DISABLE_DATABASE: Whether to disable the database, default is false, optional
+- DB_TYPE: Database type, default is sqlite, optional. Supports sqlite and postgres.
+
+When DB_TYPE is postgres, the following environment variables need to be set:
+
+- DB_USER: Database user name, default is postgres, optional
+- DB_PASSWORD: Database password, default is mysecretpassword, optional
+- DB_HOST: Database host, default is localhost, optional
+- DB_PORT: Database port, default is 5432, optional
+- DB_NAME: Database name, default is postgres, optional
 
 ## Koyeb remote deployment
 
