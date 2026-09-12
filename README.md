@@ -1233,6 +1233,8 @@ First, the uni-api will attempt to precisely match the model in the api_key_rate
 
 uni-api supports api key as a channel, and can use this feature to manage channels by grouping them.
 
+API-key channels are compiled as virtual routing nodes and dispatched in-process; uni-api does not issue an internal HTTP request to `127.0.0.1`. After the parent key selects a child key, the child key's model permissions, channel order, retry policy, and endpoint adapter continue in the same routing graph. This applies to `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, image, audio, embedding, moderation, search, and video endpoints, subject to the actual provider support configured under the child key.
+
 ```yaml
 api_keys:
   - api: sk-xxx1

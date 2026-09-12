@@ -27,6 +27,28 @@ from uni_api.routing.request_rules import provider_accepts_request_rules
 
 
 MODEL_INFO_CREATED = 1720524448858
+VIRTUAL_API_KEY_INDEX = "_virtual_api_key_index"
+VIRTUAL_API_KEY_NAME = "_virtual_api_key_name"
+
+
+def is_virtual_api_key_channel(provider: Any) -> bool:
+    """Return whether *provider* is a compiled API-key route node.
+
+    API keys used as channels are routing graph nodes, not upstream HTTP
+    providers.  Keeping an explicit marker avoids inferring this from the
+    synthetic provider name or a loopback URL.
+    """
+
+    return isinstance(provider, dict) and VIRTUAL_API_KEY_INDEX in provider
+
+
+def virtual_api_key_index(provider: Any) -> Optional[int]:
+    if not is_virtual_api_key_channel(provider):
+        return None
+    try:
+        return int(provider[VIRTUAL_API_KEY_INDEX])
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -364,13 +386,19 @@ def get_provider_list(
     for item in provider_rules:
         provider_name = item.split("/")[0]
         if provider_name.startswith("sk-") and provider_name in api_list:
+            provider_index = api_list.index(provider_name)
             provider_list.append(
                 {
                     "provider": provider_name,
-                    "base_url": "http://127.0.0.1:8000/v1/chat/completions",
+                    # This is a virtual routing node.  It intentionally has
+                    # no upstream URL: endpoint-specific handlers dispatch
+                    # directly to the child key's route plan.
+                    "base_url": "",
                     "model": [{request_model: request_model}],
                     "tools": True,
                     "_model_dict_cache": {request_model: request_model},
+                    VIRTUAL_API_KEY_INDEX: provider_index,
+                    VIRTUAL_API_KEY_NAME: provider_name,
                 }
             )
             continue

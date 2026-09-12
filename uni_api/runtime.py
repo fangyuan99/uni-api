@@ -60,7 +60,9 @@ from uni_api.routing.planner import (
     RoutingPlan,
     _call_provider_resolver,
     get_right_order_providers,
+    is_virtual_api_key_channel,
     select_provider_api_key_raw,
+    virtual_api_key_index,
 )
 from uni_api.routing.request_rules import request_reasoning_effort
 from uni_api.routing.request_types import detect_request_type
@@ -4302,6 +4304,23 @@ class ModelRequestHandler:
             provider_name = attempt.provider_name
             original_model = attempt.original_model
 
+            # API keys used as channels are virtual routing nodes.  Dispatch
+            # directly to the child plan so the original endpoint and its
+            # provider adapter are preserved; never turn this into a
+            # loopback HTTP request.
+            if is_virtual_api_key_channel(provider):
+                child_api_index = virtual_api_key_index(provider)
+                if child_api_index is None:
+                    raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+                return await self.request_model(
+                    request_data,
+                    child_api_index,
+                    background_tasks,
+                    endpoint=endpoint,
+                    current_info=current_info,
+                    http_request=http_request,
+                )
+
             original_request_model = (original_model, request_data.model)
             local_api_list = get_runtime_api_list()
             if provider_name.startswith("sk-") and provider_name in local_api_list:
@@ -7410,6 +7429,19 @@ class ResponsesRequestExecution:
         provider = attempt.provider
         provider_name = attempt.provider_name
         original_model = attempt.original_model
+        if is_virtual_api_key_channel(provider):
+            child_api_index = virtual_api_key_index(provider)
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            attempt.state.update(
+                {
+                    "virtual_api_key_index": child_api_index,
+                    "channel_id": f"{provider_name}",
+                    "failure_stage": "virtual_route",
+                    "track_channel_stats": False,
+                }
+            )
+            return
         engine, stream_mode = get_engine(provider, endpoint=self.endpoint, original_model=original_model)
         if stream_mode is not None:
             self.request_data.stream = stream_mode
@@ -7513,6 +7545,17 @@ class ResponsesRequestExecution:
 
     async def _execute_attempt(self, attempt: Any):
         provider = attempt.provider
+        if is_virtual_api_key_channel(provider):
+            child_api_index = attempt.state.get("virtual_api_key_index")
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            return await self.handler.request_responses(
+                self.http_request,
+                self.request_data,
+                int(child_api_index),
+                self.background_tasks,
+                endpoint=self.endpoint,
+            )
         engine = attempt.state["engine"]
         upstream_url = attempt.state["upstream_url"]
         proxy = attempt.state["proxy"]
@@ -9762,6 +9805,19 @@ class MessagesPassthroughHandler:
         original_model = attempt.original_model
         endpoint = ctx["endpoint"]
         request_model_name = ctx["request_model_name"]
+        if is_virtual_api_key_channel(provider):
+            child_api_index = virtual_api_key_index(provider)
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            attempt.state.update(
+                {
+                    "virtual_api_key_index": child_api_index,
+                    "channel_id": f"{provider_name}",
+                    "failure_stage": "virtual_route",
+                    "track_channel_stats": False,
+                }
+            )
+            return
         engine, stream_mode = get_engine(provider, endpoint=endpoint, original_model=original_model)
         attempt.state["failure_stage"] = "validation"
 
@@ -9811,6 +9867,17 @@ class MessagesPassthroughHandler:
 
     async def _messages_execute_attempt(self, attempt: Any, ctx: dict[str, Any]):
         provider = attempt.provider
+        if is_virtual_api_key_channel(provider):
+            child_api_index = attempt.state.get("virtual_api_key_index")
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            return await self.request_messages(
+                ctx["http_request"],
+                ctx["request_body"],
+                int(child_api_index),
+                ctx["background_tasks"],
+                endpoint=ctx["endpoint"],
+            )
         original_model = attempt.original_model
         upstream_url = attempt.state["upstream_url"]
         proxy = attempt.state["proxy"]
@@ -10759,6 +10826,19 @@ class VideoTaskHandler:
         provider_name = attempt.provider_name
         original_model = attempt.original_model
         request_model_name = ctx["request_model_name"]
+        if is_virtual_api_key_channel(provider):
+            child_api_index = virtual_api_key_index(provider)
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            attempt.state.update(
+                {
+                    "virtual_api_key_index": child_api_index,
+                    "channel_id": f"{provider_name}",
+                    "failure_stage": "virtual_route",
+                    "track_channel_stats": False,
+                }
+            )
+            return
         engine, _ = get_engine(provider, endpoint=CONTENT_GENERATION_TASKS_ENDPOINT, original_model=original_model)
         attempt.state["failure_stage"] = "validation"
         if engine != "content-generation":
@@ -10823,6 +10903,19 @@ class VideoTaskHandler:
         )
 
     async def _video_execute_attempt(self, attempt: Any, ctx: dict[str, Any]):
+        if is_virtual_api_key_channel(attempt.provider):
+            child_api_index = attempt.state.get("virtual_api_key_index")
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            return await self._request_with_model_route(
+                http_request=ctx.get("http_request"),
+                request_model_name=ctx["request_model_name"],
+                request_body=ctx.get("request_body"),
+                api_index=int(child_api_index),
+                background_tasks=ctx["background_tasks"],
+                method=ctx["method"],
+                task_id=ctx.get("task_id"),
+            )
         upstream_request = attempt.state["upstream_request"]
         payload = upstream_request.payload
         channel_id = attempt.state["channel_id"]
@@ -11125,6 +11218,19 @@ class LingjingOpenapiHandler:
         original_model = attempt.original_model
         endpoint = ctx["endpoint"]
         request_model_name = ctx["request_model_name"]
+        if is_virtual_api_key_channel(provider):
+            child_api_index = virtual_api_key_index(provider)
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            attempt.state.update(
+                {
+                    "virtual_api_key_index": child_api_index,
+                    "channel_id": f"{provider_name}",
+                    "failure_stage": "virtual_route",
+                    "track_channel_stats": False,
+                }
+            )
+            return
         attempt.state["failure_stage"] = "validation"
         if not _is_lingjing_provider(provider):
             raise HTTPException(status_code=400, detail=f"{endpoint} only supports Lingjing providers")
@@ -11164,6 +11270,19 @@ class LingjingOpenapiHandler:
         attempt.state["timeout_policy_sources"] = timeout_resolution["timeout_policy_sources"]
 
     async def _lingjing_execute_attempt(self, attempt: Any, ctx: dict[str, Any]) -> Response:
+        if is_virtual_api_key_channel(attempt.provider):
+            child_api_index = attempt.state.get("virtual_api_key_index")
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            return await self.request_openapi(
+                ctx["http_request"],
+                ctx.get("payload"),
+                int(child_api_index),
+                ctx["background_tasks"],
+                method=ctx["method_upper"],
+                openapi_path=ctx["openapi_path"],
+                endpoint=ctx["endpoint"],
+            )
         headers = _lingjing_headers(
             attempt.provider,
             attempt.state["api_key"],

@@ -7,7 +7,9 @@ from uni_api.routing.core import (  # noqa: F401
     get_provider_list,
     get_provider_rules,
     get_right_order_providers,
+    is_virtual_api_key_channel,
     select_provider_api_key_raw,
+    virtual_api_key_index,
 )
 
 

@@ -20,7 +20,9 @@ from uni_api.providers.payloads import force_codex_client_headers
 from uni_api.routing.planner import (
     RoutingPlan,
     get_right_order_providers,
+    is_virtual_api_key_channel,
     select_provider_api_key_raw,
+    virtual_api_key_index,
 )
 from uni_api.routing.request_rules import request_reasoning_effort
 from uni_api.upstream.urls import normalize_alpha_search_upstream_url
@@ -320,6 +322,18 @@ class _AlphaSearchExecution:
         provider = attempt.provider
         provider_name = attempt.provider_name
         original_model = attempt.original_model
+        if is_virtual_api_key_channel(provider):
+            child_api_index = virtual_api_key_index(provider)
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            attempt.state.update(
+                {
+                    "virtual_api_key_index": child_api_index,
+                    "channel_id": f"{provider_name}",
+                    "failure_stage": "virtual_route",
+                }
+            )
+            return
         upstream_url = normalize_alpha_search_upstream_url(
             provider.get("base_url", "")
         )
@@ -362,6 +376,15 @@ class _AlphaSearchExecution:
         )
 
     async def _execute_attempt(self, attempt: Any) -> Response:
+        if is_virtual_api_key_channel(attempt.provider):
+            child_api_index = attempt.state.get("virtual_api_key_index")
+            if child_api_index is None:
+                raise HTTPException(status_code=500, detail="Invalid virtual API key route")
+            return await self.handler.request_search(
+                http_request=self.http_request,
+                request_body=self.request_body,
+                api_index=int(child_api_index),
+            )
         payload = dict(self.request_body)
         payload["model"] = attempt.original_model
         json_payload = await run_json_cpu(

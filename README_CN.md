@@ -1225,6 +1225,8 @@ api_key_rate_limit:
 
 uni-api 支持将 api key 本身作为渠道，可以通过这一特性对渠道进行分组管理。
 
+API key 渠道在运行时作为虚拟路由节点处理，不会向 `127.0.0.1` 发起内部 HTTP 请求。父 key 选择子 key 后，子 key 的模型权限、渠道顺序、重试和端点适配会在同一请求路由图中继续执行。因此该写法同样适用于 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`、图片、音频、embedding、moderation、search 和视频端点；最终是否可用仍取决于子 key 下实际 provider 对该端点的支持。
+
 ```yaml
 api_keys:
   - api: sk-xxx1

@@ -1160,7 +1160,9 @@ def test_get_right_order_providers_resolves_nested_api_key_route():
             models_list,
         )
         assert [provider["provider"] for provider in providers] == ["sk-child"]
-        assert providers[0]["base_url"] == "http://127.0.0.1:8000/v1/chat/completions"
+        assert providers[0]["base_url"] == ""
+        assert providers[0]["_virtual_api_key_name"] == "sk-child"
+        assert providers[0]["_virtual_api_key_index"] == 1
 
     asyncio.run(run())
 
