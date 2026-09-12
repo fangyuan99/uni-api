@@ -767,6 +767,24 @@ impl NativeConfigStore {
                 message: "Tokens per request limit exceeded".into(),
             });
         }
+        if admit_rate {
+            for child in nested_keys_for_model(&snapshot, &api_key, request_model) {
+                if let Some(rules) =
+                    parse_rate_limits(child.preferences.get("rate_limit"), Some(request_model))
+                {
+                    if tpr_exceeded(&rules, estimated_tokens)
+                        || !self
+                            .admit_rate(&format!("client:{}", child.token), &rules)
+                            .await
+                    {
+                        return Err(RouteResolutionError {
+                            status: StatusCode::TOO_MANY_REQUESTS,
+                            message: "Nested API-key rate limit exceeded".into(),
+                        });
+                    }
+                }
+            }
+        }
         if admit_rate
             && (!self.admit_rate("__global__", &global_rules).await
                 || !self
@@ -853,6 +871,12 @@ impl NativeConfigStore {
             .preferences
             .get("SCHEDULING_ALGORITHM")
             .and_then(Value::as_str)
+            .or_else(|| {
+                api_key
+                    .preferences
+                    .get("api_key_schedule_algorithm")
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("fixed_priority")
             .trim()
             .to_ascii_lowercase();
@@ -2237,6 +2261,46 @@ pub async fn prepare_native_request(
         final_emitted: false,
         _memory_reservation: memory_reservation,
     })
+}
+
+fn nested_keys_for_model(snapshot: &Snapshot, key: &ApiKey, model: &str) -> Vec<Arc<ApiKey>> {
+    fn walk(
+        snapshot: &Snapshot,
+        key: &ApiKey,
+        model: &str,
+        out: &mut Vec<Arc<ApiKey>>,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) {
+        if !seen.insert(key.token.to_string()) {
+            return;
+        }
+        let rules = key
+            .preferences
+            .get("__route_graph")
+            .and_then(Value::as_array)
+            .map(|v| v.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for rule in rules {
+            let Some((alias, requested)) = rule.split_once('/') else {
+                continue;
+            };
+            if (requested == "*" || requested == model) && snapshot.api_keys.get(alias).is_some() {
+                let child = snapshot.api_keys.get(alias).unwrap();
+                out.push(child.clone());
+                walk(snapshot, child, model, out, seen);
+            }
+        }
+        seen.remove(key.token.as_ref());
+    }
+    let mut out = Vec::new();
+    walk(
+        snapshot,
+        key,
+        model,
+        &mut out,
+        &mut std::collections::BTreeSet::new(),
+    );
+    out
 }
 
 fn matching_providers(
