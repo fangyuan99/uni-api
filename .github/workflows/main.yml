@@ -1,29 +1,16 @@
-name: Docker Build and Publish Docker Image
+name: Rust Docker Build and Publish
 
 on:
   push:
     branches:
       - main
     paths:
-      - main.py
-      - fugue_observability.py
-      - db.py
-      - routing.py
-      - upstream.py
-      - utils.py
-      - core/**
-      - core
-      - uni_api/**
-      - uni_api
       - static/**
       - Dockerfile
       - .dockerignore
       - rust/**
-      - pyproject.toml
-      - uv.lock
       - docker-compose.yml
       - .github/workflows/main.yml
-      - .github/workflows/release.yml
       - .gitmodules
   workflow_dispatch:
 
@@ -67,37 +54,15 @@ jobs:
           git rebase origin/main
           git submodule update --init --recursive
 
-          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          VERSION=$(grep '^version = ' rust/uni-api-native/Cargo.toml | awk -F'"' '{print $2}')
           IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
           PATCH=$((VERSION_PARTS[2] + 1))
           NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
-          sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
-          NEW_VERSION="$NEW_VERSION" python - <<'PY'
-          from pathlib import Path
-          import os
-
-          lock_path = Path("uv.lock")
-          lines = lock_path.read_text().splitlines()
-          in_uni_api_package = False
-          for index, line in enumerate(lines):
-              if line == "[[package]]":
-                  in_uni_api_package = False
-                  continue
-              if line == 'name = "uni-api"':
-                  in_uni_api_package = True
-                  continue
-              if in_uni_api_package and line.startswith("version = "):
-                  lines[index] = f'version = "{os.environ["NEW_VERSION"]}"'
-                  break
-          else:
-              raise SystemExit("uni-api package version not found in uv.lock")
-
-          lock_path.write_text("\n".join(lines) + "\n")
-          PY
+          sed -i "s/^version = .*/version = "$NEW_VERSION"/" rust/uni-api-native/Cargo.toml
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add pyproject.toml uv.lock
+          git add rust/uni-api-native/Cargo.toml rust/uni-api-native/Cargo.lock
           git commit -m "📖 Bump version to $NEW_VERSION [skip ci]"
           git push origin HEAD:main
 

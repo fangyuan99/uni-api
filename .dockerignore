@@ -5,10 +5,7 @@ __pycache__
 .vscode
 node_modules
 .wrangler
-.pytest_cache
-.venv/
 .git
-uni_api/_uni_api_native*.so
 *.jpg
 *.json
 !vercel.json
@@ -38,8 +35,7 @@ Dockerfile.debug
 *.md
 !README.md
 *.toml
-!pyproject.toml
-!rust/
+!!rust/
 rust/**
 !rust/uni-api-native/
 !rust/uni-api-native/Cargo.toml

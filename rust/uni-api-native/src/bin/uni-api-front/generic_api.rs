@@ -5650,9 +5650,7 @@ fn callxyq_video_payload(input: &Value, model: &str) -> Result<Value, String> {
                 "{model} does not support ratio/aspect_ratio {ratio}"
             ));
         }
-        if (sora2 && resolution != "720p")
-            || (!sora2 && resolution != "480p" && resolution != "720p")
-        {
+        if resolution != "720p" && (sora2 || resolution != "480p") {
             return Err("callxyq Sora resolution is unsupported".into());
         }
         let seconds = get("seconds")

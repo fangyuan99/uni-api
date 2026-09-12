@@ -1716,7 +1716,6 @@ dependencies = [
  "libc",
  "memchr",
  "multer",
- "pyo3",
  "reqwest",
  "ring",
  "rusqlite",

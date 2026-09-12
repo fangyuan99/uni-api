@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.84"
 
-[lib]
-name = "_uni_api_native"
-crate-type = ["cdylib"]
-
 [dependencies]
 # Exact versions keep the production Rust 1.84 toolchain reproducible. The
 # resolver config selects only transitive releases whose declared MSRV fits.
@@ -21,7 +17,6 @@ hyper-rustls = { version = "=0.27.7", default-features = false, features = ["htt
 libc = "=0.2.189"
 memchr = "2.7.4"
 multer = "=3.1.0"
-pyo3 = { version = "0.28.3", features = ["extension-module"] }
 reqwest = { version = "=0.12.22", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots", "socks", "stream"] }
 ring = "=0.17.14"
 rusqlite = { version = "=0.32.1", features = ["bundled"] }

@@ -425,8 +425,6 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED、FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED、FUGUE_OBSERVABILITY_METRICS_ENABLED: 可选开关，用于控制 Fugue 请求摘要、spans 和 metrics。观测导出失败只会丢弃观测数据，不影响业务请求。
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: 可选人类可读 stdout 请求摘要日志开关，默认 `true`。
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: 可选人类可读 stdout 请求摘要日志采样率，默认 `1.0`。高并发压测时可以调低或关闭。
-- UNI_API_RUST_RESPONSES_DATA_PLANE: 是否为流式 `/v1/responses` 启用 Rust 的 socket→SSE→下游数据路径，默认 `true`。带 `Idempotency-Key` 的请求也保留在 Rust 数据面：Rust 负责凭证作用域请求哈希、owner/wait/replay/conflict 协调和有界零拷贝响应缓存；`IDEMPOTENCY_*` 的 TTL、条目数、总缓存和单响应限制继续生效，未完成请求/响应字节另由 `RUST_IDEMPOTENCY_MAX_INFLIGHT_REQUEST_BYTES` 与 `RUST_IDEMPOTENCY_MAX_INFLIGHT_RESPONSE_BYTES` 限制（均默认 128 MiB）。设为 `false` 并重启进程即可在不更换镜像的情况下立即回退到 Python 数据路径。
-- Rust 与 Python 现在共用 `MEMORY_SOFT_LIMIT_BYTES`、`MEMORY_GUARD_BYTES`、`MEMORY_GUARD_RATIO`、`MEMORY_FALLBACK_BUDGET_BYTES` 的 cgroup 策略，并通过同一共享账本核算 parsed body、serialized body、transport buffer 和 response buffer。
 - `MESSAGES_REQUEST_SPOOL_THRESHOLD_BYTES`、`MESSAGES_REQUEST_SPOOL_MAX_VARIANTS`、`MESSAGES_REQUEST_TRANSPORT_CHUNK_BYTES`、`MESSAGES_REQUEST_SPOOL_DIRECTORY` 控制 `/v1/messages` 上游请求磁盘重放。默认 1 MiB 及以上由 Rust 直接序列化到请求级临时文件，最多缓存 4 个 provider-specific 版本，每次重试重新打开并以 256 KiB 分块发送；provider 顺序和重试次数不变。
 
 ### 加权资源接入
@@ -504,12 +502,8 @@ CLI 的 `--limit-concurrency` 在非 legacy 模式也会被拒绝，避免旧部
 
 ## Ubuntu 部署
 
-在仓库 Releases 找到对应的二进制文件最新版本，例如名为 uni-api-linux-x86_64-0.0.99.pex 的文件。在服务器下载二进制文件并运行：
 
 ```bash
-wget https://github.com/yym68686/uni-api/releases/download/v0.0.99/uni-api-linux-x86_64-0.0.99.pex
-chmod +x uni-api-linux-x86_64-0.0.99.pex
-./uni-api-linux-x86_64-0.0.99.pex
 ```
 
 ## serv00 远程部署（FreeBSD 14.0）
@@ -523,10 +517,7 @@ ssh 登陆到 serv00 服务器，执行下面的命令：
 ```bash
 git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
 cd uni-api
-python -m venv uni-api
 source uni-api/bin/activate
-pip install --upgrade pip
-cpuset -l 0 pip install -vv -r pyproject.toml
 ```
 
 从开始安装到安装完成需要等待10分钟，安装完成后执行下面的命令：
@@ -539,7 +530,6 @@ export DISABLE_DATABASE=true
 # 修改端口，xxx 为端口，自行修改，对应刚刚在面板 Port reservation 开的端口
 sed -i '' 's/port=8000/port=xxx/' main.py
 sed -i '' 's/reload=True/reload=False/' main.py
-python main.py
 ```
 
 使用 ctrl+b d 退出 tmux，即可让程序后台运行。此时就可以在其他聊天客户端使用 uni-api 了。curl 测试脚本：
@@ -553,7 +543,6 @@ curl -X POST https://xxx.serv00.net/v1/chat/completions \
 
 参考文档：
 
-https://docs.serv00.com/Python/
 
 https://linux.do/t/topic/201181
 
@@ -773,33 +762,7 @@ curl -X POST 'https://xxx.xxx/v1/chat/completions' \
 }'
 ```
 
-pex linux 打包：
-
-```bash
-VERSION=$(cat VERSION)
-rm -rf pex-src
-mkdir -p pex-src
-cp main.py upstream.py utils.py routing.py db.py fugue_observability.py pyproject.toml pex-src/
-cp -R core uni_api video static pex-src/
-find pex-src -name '__pycache__' -type d -prune -exec rm -rf {} +
-find pex-src -name '*.pyc' -delete
-find pex-src -name '.git' -prune -exec rm -rf {} +
-pex -D pex-src -r requirements.txt \
-    -m main \
-    --interpreter-constraint '==3.11.*' \
-    --no-strip-pex-env \
-    -o uni-api-linux-x86_64-${VERSION}.pex
-```
-
-macos 打包：
-
-```bash
-VERSION=$(cat VERSION)
-pex -D pex-src -r requirements.txt \
-    -m main \
-    --interpreter-constraint '==3.11.*' \
-    -o uni-api-macos-arm64-${VERSION}.pex
-```
+Rust 发布二进制由 Docker/Rust CI workflow 构建。
 
 ## HuggingFace Space 远程部署
 
@@ -886,10 +849,8 @@ else
   fi
 fi
 
-echo "DEBUG: About to execute python main.py..."
 # 不需要使用--config参数，因为程序有默认路径
 cd /home
-exec python main.py "$@"
 ```
 
 ## uni-api 前端部署
@@ -1282,7 +1243,6 @@ mock_server：[test/mock_server.go](test/mock_server.go)
 go run test/mock_server.go
 # 100 10 120s
 locust -f test/locustfile.py
-python main.py
 ```
 
 压测结果：

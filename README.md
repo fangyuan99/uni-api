@@ -424,7 +424,6 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: Optional switch for human-readable stdout request summary logs, default is `true`.
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: Optional sample rate for human-readable stdout request summary logs, default is `1.0`. Use a lower value or disable the logs during high-concurrency tests.
 - REQUEST_MAX_BODY_BYTES: Rust request-body maximum in bytes, default `134217728` (128 MiB). Ordinary bodies are checked by declared length and actual streamed bytes, including uploads without `Content-Length`. Exactly the limit is accepted; larger bodies return HTTP 413. This also caps both compressed and decoded zstd bodies. `ZSTD_REQUEST_MAX_BODY_BYTES` optionally supplies a smaller shared zstd limit; `ZSTD_REQUEST_MAX_COMPRESSED_BODY_BYTES` and `ZSTD_REQUEST_MAX_DECOMPRESSED_BODY_BYTES` override the two zstd limits independently, capped by `REQUEST_MAX_BODY_BYTES`. These environment settings can be changed independently of the image and take effect on process restart. Effective Rust limits are exposed as `request_body_limits` at `/v1/observability/runtime`. Resource headroom, endpoint-specific limits (such as admin configuration updates), and provider limits still apply.
-- UNI_API_RUST_RESPONSES_DATA_PLANE: Enables the Rust socket-to-SSE-to-downstream path for `/v1/responses`, default is `true`. Every enabled request is incrementally spooled to local disk without retaining the complete request in Rust memory. When `Idempotency-Key` is present, Rust also hashes each incoming chunk and performs credential-scoped owner/wait/replay/conflict coordination. Requests are bounded by `REQUEST_MAX_BODY_BYTES`. Admission also follows live cgroup-memory, FD, connection, ephemeral-port, disk-byte, and inode headroom; pressure backpressures until `RUST_RESOURCE_WAIT_TIMEOUT_SECONDS`, then returns 503 or 507. `RUST_REQUEST_SPOOL_DIRECTORY` defaults to `/tmp/uni-api-request-spool`. Rust and Python use the same `MEMORY_SOFT_LIMIT_BYTES`, `MEMORY_GUARD_BYTES`, `MEMORY_GUARD_RATIO`, and `MEMORY_FALLBACK_BUDGET_BYTES` policy and one shared reservation ledger for parsed bodies, serialized bodies, transport buffers, and response buffers. The other reserve ratios use `RUST_FD_RESERVE_BPS`, `RUST_EPHEMERAL_PORT_RESERVE_BPS`, `RUST_REQUEST_SPOOL_DISK_RESERVE_BPS`, and `RUST_REQUEST_SPOOL_INODE_RESERVE_BPS`. `IDEMPOTENCY_*` response-cache limits and `RUST_IDEMPOTENCY_MAX_INFLIGHT_RESPONSE_BYTES` remain authoritative. Set the switch to `false` for an immediate process-restart fallback to the Python data path without changing the image.
 - MESSAGES_REQUEST_SPOOL_THRESHOLD_BYTES, MESSAGES_REQUEST_SPOOL_MAX_VARIANTS, MESSAGES_REQUEST_TRANSPORT_CHUNK_BYTES, MESSAGES_REQUEST_SPOOL_DIRECTORY: Control `/v1/messages` upstream request replay. Bodies at or above the default 1 MiB threshold are serialized by Rust directly to a request-scoped file, cached for at most four provider-specific variants, and reopened in 256 KiB chunks for every retry without changing provider order or retry count.
 
 ### Weighted resource admission
@@ -460,9 +459,7 @@ active counts remain informational and never make admission decisions.
 JSON request sizing uses the same cgroup memory envelope instead of a fixed
 256 MiB materialization estimate. A `/v1/responses` request carrying a valid
 Rust control token and matching completed-local-spool metadata has no separate
-wire-size or per-request retained-memory ceiling in Python; its incremental
 memory estimate grows only against the shared parent governor and waits for
-capacity before a 503 timeout. Untrusted/direct Python request paths retain the
 configured product limits. Weighted mode has no separate large-body request
 count. The legacy threshold/slot diagnostics remain available only in
 `RESOURCE_ADMISSION_MODE=legacy`.
@@ -522,12 +519,8 @@ Then click the Deploy button.
 
 ## Ubuntu deployment
 
-In the warehouse Releases, find the latest version of the corresponding binary file, for example, a file named uni-api-linux-x86_64-0.0.99.pex. Download the binary file on the server and run it:
 
 ```bash
-wget https://github.com/yym68686/uni-api/releases/download/v0.0.99/uni-api-linux-x86_64-0.0.99.pex
-chmod +x uni-api-linux-x86_64-0.0.99.pex
-./uni-api-linux-x86_64-0.0.99.pex
 ```
 
 ## Serv00 Remote Deployment (FreeBSD 14.0)
@@ -541,10 +534,7 @@ ssh login to the serv00 server, execute the following command:
 ```bash
 git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
 cd uni-api
-python -m venv uni-api
 source uni-api/bin/activate
-pip install --upgrade pip
-cpuset -l 0 pip install -vv -r requirements.txt
 ```
 
 From the start of installation to the completion of installation, it will take about 10 minutes. After the installation is complete, execute the following command:
@@ -557,7 +547,6 @@ export DISABLE_DATABASE=true
 # Modify the port, xxx is the port, modify it yourself, corresponding to the port opened in the panel Port reservation
 sed -i '' 's/port=8000/port=xxx/' main.py
 sed -i '' 's/reload=True/reload=False/' main.py
-python main.py
 ```
 
 Use ctrl+b d to exit tmux, allowing the program to run in the background. At this point, you can use uni-api in other chat clients. curl test script:
@@ -571,7 +560,6 @@ curl -X POST https://xxx.serv00.net/v1/chat/completions \
 
 Reference document:
 
-https://docs.serv00.com/Python/
 
 https://linux.do/t/topic/201181
 
@@ -580,10 +568,8 @@ https://linux.do/t/topic/218738
 ## Docker local deployment
 
 The default image runs the complete API in the Rust runtime and does not start
-a Python worker. Mount `api.yaml` (or set `CONFIG_URL`) as before. To build the
-temporary Python compatibility image during migration or rollback, use
 `docker build --target legacy-runtime ...`; that target sets
-`UNI_API_RUNTIME=hybrid`.
+`UNI_API_RUNTIME=rust`.
 
 Start the container
 
@@ -797,33 +783,7 @@ curl -X POST 'https://xxx.xxx/v1/chat/completions' \
 }'
 ```
 
-pex linux packaging:
-
-```bash
-VERSION=$(cat VERSION)
-rm -rf pex-src
-mkdir -p pex-src
-cp main.py upstream.py utils.py routing.py db.py fugue_observability.py pyproject.toml pex-src/
-cp -R core uni_api video static pex-src/
-find pex-src -name '__pycache__' -type d -prune -exec rm -rf {} +
-find pex-src -name '*.pyc' -delete
-find pex-src -name '.git' -prune -exec rm -rf {} +
-pex -D pex-src -r requirements.txt \
-    -m main \
-    --interpreter-constraint '==3.11.*' \
-    --no-strip-pex-env \
-    -o uni-api-linux-x86_64-${VERSION}.pex
-```
-
-macOS packaging:
-
-```bash
-VERSION=$(cat VERSION)
-pex -D pex-src -r requirements.txt \
-    -m main \
-    --interpreter-constraint '==3.11.*' \
-    -o uni-api-macos-arm64-${VERSION}.pex
-```
+Rust release binaries are built by the Docker/Rust CI workflow.
 
 ## HuggingFace Space Remote Deployment
 
@@ -909,10 +869,8 @@ else
     exit 1
   fi
 fi
-echo "DEBUG: About to execute python main.py..."
 # No need to use the --config parameter as the program has a default path
 cd /home
-exec python main.py "$@"
 ```
 
 ## uni-api frontend deployment
@@ -1291,7 +1249,6 @@ Start load testing:
 go run test/mock_server.go
 # 100 10 120s
 locust -f test/locustfile.py
-python main.py
 ```
 
 Load testing result:

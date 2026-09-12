@@ -1,4 +1,3 @@
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
@@ -33,7 +32,6 @@ pub async fn handle(
                 StatusCode::OK,
                 json!({
                     "runtime": "rust",
-                    "python_compat_enabled": state.python_compat_enabled,
                     "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),
@@ -485,17 +483,7 @@ fn unix_seconds() -> i64 {
 }
 
 fn app_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION
-        .get_or_init(|| {
-            let project = include_str!("../../../../../pyproject.toml");
-            project
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("version = \"")?.strip_suffix('"'))
-                .unwrap_or("unknown")
-                .to_owned()
-        })
-        .as_str()
+    "1.7.275"
 }
 
 #[cfg(test)]
