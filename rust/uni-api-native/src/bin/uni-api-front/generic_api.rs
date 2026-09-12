@@ -67,6 +67,7 @@ enum ResponseAdapter {
     CloudflareToChat,
     AwsToChat,
     LingjingVideo,
+    CallxyqVideo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2294,7 +2295,7 @@ fn build_attempt(
             payload = callxyq_video_payload(&payload, original_model)?;
             (
                 callxyq_video_url(provider.base_url.as_ref(), None)?,
-                ResponseAdapter::Passthrough,
+                ResponseAdapter::CallxyqVideo,
                 false,
             )
         }
@@ -2308,7 +2309,7 @@ fn build_attempt(
             let task_id = path.trim_start_matches("/v1/video/tasks/");
             (
                 callxyq_video_url(provider.base_url.as_ref(), Some(task_id))?,
-                ResponseAdapter::Passthrough,
+                ResponseAdapter::CallxyqVideo,
                 false,
             )
         }
@@ -2413,7 +2414,10 @@ fn build_attempt(
     };
     if !matches!(
         adapter,
-        ResponseAdapter::GeminiToChat | ResponseAdapter::AwsToChat | ResponseAdapter::LingjingVideo
+        ResponseAdapter::GeminiToChat
+            | ResponseAdapter::AwsToChat
+            | ResponseAdapter::LingjingVideo
+            | ResponseAdapter::CallxyqVideo
     ) && engine != "vertex-claude"
         && !is_alpha_search
     {
@@ -3038,7 +3042,7 @@ async fn send_attempt(
             ResponseAdapter::CohereToChat => StreamProtocol::Cohere,
             ResponseAdapter::CloudflareToChat => StreamProtocol::Cloudflare,
             ResponseAdapter::AwsToChat => StreamProtocol::AwsBedrock,
-            ResponseAdapter::LingjingVideo => unreachable!(),
+            ResponseAdapter::LingjingVideo | ResponseAdapter::CallxyqVideo => unreachable!(),
             ResponseAdapter::Passthrough => StreamProtocol::Chat,
             ResponseAdapter::Search => unreachable!(),
         };
@@ -3163,6 +3167,12 @@ async fn send_attempt(
             &prepared.url,
             &upstream,
         ),
+        ResponseAdapter::CallxyqVideo => normalize_callxyq_video_response(
+            &prepared.method,
+            &prepared.request_model,
+            &upstream,
+            prepared.estimated_video_tokens,
+        ),
         ResponseAdapter::Passthrough => upstream,
     };
     let normalized = if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
@@ -3170,7 +3180,11 @@ async fn send_attempt(
     } else {
         normalized
     };
-    if prepared.adapter == ResponseAdapter::LingjingVideo && prepared.method == Method::POST {
+    if matches!(
+        prepared.adapter,
+        ResponseAdapter::LingjingVideo | ResponseAdapter::CallxyqVideo
+    ) && prepared.method == Method::POST
+    {
         if let Some(task_id) = normalized.get("id").and_then(Value::as_str) {
             remember_video_task(
                 task_id,
@@ -5533,6 +5547,12 @@ fn callxyq_video_payload(input: &Value, model: &str) -> Result<Value, String> {
     let object = input
         .as_object()
         .ok_or_else(|| "video task request body must be an object".to_owned())?;
+    let options = object
+        .get("provider_options")
+        .and_then(|v| v.get("callxyq"))
+        .or_else(|| object.get("provider_options"))
+        .and_then(Value::as_object);
+    let get = |key: &str| object.get(key).or_else(|| options.and_then(|o| o.get(key)));
     let prompt = object
         .get("prompt")
         .and_then(Value::as_str)
@@ -5540,34 +5560,247 @@ fn callxyq_video_payload(input: &Value, model: &str) -> Result<Value, String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "callxyq video requests require prompt".to_owned())?;
-    let mut payload = Map::new();
-    payload.insert("model".into(), Value::String(model.to_owned()));
-    payload.insert("prompt".into(), Value::String(prompt.to_owned()));
-    for key in [
-        "size",
-        "seconds",
-        "duration",
-        "aspect_ratio",
-        "resolution",
-        "negative_prompt",
-        "generate_audio",
-        "image_url",
-        "reference_image_urls",
-        "reference_video",
-        "reference_videos",
-        "audio_url",
-        "video_config",
-    ] {
-        if let Some(value) = object.get(key) {
-            payload.insert(key.into(), value.clone());
+    let protocol = if model.to_ascii_lowercase().starts_with("gemini-veo") {
+        "veo"
+    } else {
+        "sora"
+    };
+    let mut images = Vec::new();
+    let mut videos = Vec::new();
+    let mut audios = Vec::new();
+    if let Some(parts) = object.get("content").and_then(Value::as_array) {
+        for part in parts.iter().filter_map(Value::as_object) {
+            let kind = part
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("image")
+                .to_ascii_lowercase();
+            let value = part
+                .get("image_url")
+                .or_else(|| part.get("video_url"))
+                .or_else(|| part.get("audio_url"))
+                .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)))
+                .map(str::trim)
+                .unwrap_or("");
+            if value.is_empty() {
+                continue;
+            }
+            if value.starts_with("asset://") || value.starts_with("Asset-") {
+                return Err("callxyq resources require public URL or data URL; asset_id resources are not supported".into());
+            }
+            match kind.as_str() {
+                "image" | "image_url" => images.push(value.to_owned()),
+                "video" | "video_url" => videos.push(value.to_owned()),
+                "audio" | "audio_url" => audios.push(value.to_owned()),
+                other => return Err(format!("Unsupported callxyq resource type: {other}")),
+            }
         }
     }
-    if !payload.contains_key("seconds") {
-        if let Some(value) = object.get("duration") {
-            payload.insert("seconds".into(), value.clone());
+    let ratio = get("aspect_ratio")
+        .or_else(|| get("ratio"))
+        .and_then(Value::as_str)
+        .unwrap_or("16:9")
+        .to_owned();
+    let size = get("size").and_then(Value::as_str).map(str::to_owned);
+    let resolution = get("resolution")
+        .and_then(Value::as_str)
+        .unwrap_or("720p")
+        .to_ascii_lowercase();
+    let mut payload = Map::new();
+    payload.insert("model".into(), json!(model));
+    payload.insert("prompt".into(), json!(prompt));
+    if protocol == "sora" {
+        let sora2 = model.eq_ignore_ascii_case("sora-2");
+        let sora3 = matches!(
+            model.to_ascii_lowercase().as_str(),
+            "sora-v3-fast" | "sora-v3-pro"
+        );
+        if !sora2 && !sora3 {
+            return Err(format!("Unsupported callxyq Sora model: {model}"));
+        }
+        let allowed = if sora2 {
+            ["16:9", "9:16"].as_slice()
+        } else {
+            ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"].as_slice()
+        };
+        if !allowed.contains(&ratio.as_str()) {
+            return Err(format!(
+                "{model} does not support ratio/aspect_ratio {ratio}"
+            ));
+        }
+        if (sora2 && resolution != "720p")
+            || (!sora2 && resolution != "480p" && resolution != "720p")
+        {
+            return Err("callxyq Sora resolution is unsupported".into());
+        }
+        let seconds = get("seconds")
+            .or_else(|| get("duration"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(if sora2 { 4 } else { 5 });
+        if (sora2 && ![4, 8, 12].contains(&seconds)) || (!sora2 && !(5..=15).contains(&seconds)) {
+            return Err("callxyq Sora duration is unsupported".into());
+        }
+        if (sora2 && (!videos.is_empty() || !audios.is_empty()))
+            || images.len() > if sora2 { 1 } else { 4 }
+            || videos.len() > 3
+            || audios.len() > 1
+            || (!audios.is_empty() && images.is_empty())
+        {
+            return Err("callxyq Sora resource limits exceeded".into());
+        }
+        if images.len() > 1 || !videos.is_empty() || !audios.is_empty() {
+            for i in 1..=images.len() {
+                if !prompt.contains(&format!("@Image{i}")) {
+                    return Err(format!(
+                        "callxyq Sora multi-resource prompts must reference @Image{i}"
+                    ));
+                }
+            }
+        }
+        payload.insert("aspect_ratio".into(), json!(ratio));
+        payload.insert("resolution".into(), json!(resolution));
+        payload.insert("seconds".into(), json!(seconds));
+        let computed_size = size.unwrap_or_else(|| {
+            if ratio == "9:16" {
+                format!("720x{}", resolution.trim_end_matches('p'))
+            } else {
+                format!(
+                    "{}x{}",
+                    (16 * resolution
+                        .trim_end_matches('p')
+                        .parse::<i64>()
+                        .unwrap_or(720))
+                        / 9,
+                    resolution.trim_end_matches('p')
+                )
+            }
+        });
+        payload.insert("size".into(), json!(computed_size));
+        if let Some(first) = images.first() {
+            payload.insert(
+                if sora2 || images.len() == 1 {
+                    "image_url"
+                } else {
+                    "reference_image_urls"
+                }
+                .into(),
+                if sora2 || images.len() == 1 {
+                    json!(first)
+                } else {
+                    json!(images)
+                },
+            );
+        }
+        if let Some(first) = videos.first() {
+            payload.insert("reference_video".into(), json!(first));
+            payload.insert("reference_videos".into(), json!(videos));
+        }
+        if let Some(first) = audios.first() {
+            payload.insert("audio_url".into(), json!(first));
+            payload.insert(
+                "video_config".into(),
+                get("video_config").cloned().unwrap_or_else(
+                    || json!({"reference_mode":"image_reference","motion_has_audio":true}),
+                ),
+            );
+        }
+    } else {
+        if !videos.is_empty() || !audios.is_empty() {
+            return Err("callxyq Veo models do not support video or audio resources".into());
+        }
+        let max_images = if model.contains("-ref-") { 3 } else { 2 };
+        if images.len() > max_images {
+            return Err("callxyq Veo image reference limit exceeded".into());
+        }
+        let size = size.unwrap_or_else(|| {
+            if ratio == "9:16" {
+                if resolution == "1080p" {
+                    "1080x1920"
+                } else {
+                    "720x1280"
+                }
+            } else if ratio == "16:9" {
+                if resolution == "1080p" {
+                    "1920x1080"
+                } else {
+                    "1280x720"
+                }
+            } else {
+                ""
+            }
+            .into()
+        });
+        if !["1280x720", "720x1280", "1920x1080", "1080x1920"].contains(&size.as_str()) {
+            return Err(format!("Unsupported callxyq Veo size: {size}"));
+        }
+        payload.insert("size".into(), json!(size));
+        if let Some(v) = get("generate_audio").or_else(|| get("audio")) {
+            payload.insert("generate_audio".into(), json!(v.as_bool().unwrap_or(false)));
+        }
+        if let Some(first) = images.first() {
+            payload.insert(
+                if images.len() == 1 {
+                    "image_url"
+                } else {
+                    "images"
+                }
+                .into(),
+                if images.len() == 1 {
+                    json!(first)
+                } else {
+                    json!(images)
+                },
+            );
         }
     }
     Ok(Value::Object(payload))
+}
+
+fn normalize_callxyq_video_response(
+    method: &Method,
+    model: &str,
+    obj: &Value,
+    estimated: Option<i64>,
+) -> Value {
+    let root = obj.as_object().cloned().unwrap_or_default();
+    let id = root
+        .get("id")
+        .or_else(|| root.get("task_id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let status = match root
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "completed" => "succeeded",
+        "in_progress" | "processing" => "running",
+        "canceled" | "cancelled" => "cancelled",
+        "failed" => "failed",
+        "queued" => "queued",
+        _ => "queued",
+    };
+    let mut out = json!({"id":id,"model":model,"provider":"callxyq","status":status});
+    if method == Method::POST {
+        if let Some(v) = root.get("created_at") {
+            out["created_at"] = v.clone();
+        }
+    } else {
+        let mut video = json!({});
+        if let Some(v) = root.get("video_url") {
+            video["url"] = v.clone();
+        }
+        if let Some(v) = root.get("size") {
+            video["size"] = v.clone();
+        }
+        out["video"] = video;
+        if status == "succeeded" {
+            out["usage"] = json!({"video_tokens":estimated.unwrap_or(0),"completion_tokens":estimated.unwrap_or(0),"total_tokens":estimated.unwrap_or(0)});
+        }
+    }
+    out
 }
 
 fn video_tasks_url(base: &str) -> String {
@@ -6659,6 +6892,50 @@ mod tests {
             cloudflare_url(&cloudflare, "@cf/meta/llama").unwrap(),
             "https://api.cloudflare.com/client/v4/accounts/account-a/ai/run/@cf/meta/llama"
         );
+    }
+
+    #[test]
+    fn callxyq_sora_and_veo_payloads_match_python_validation_contract() {
+        let sora = callxyq_video_payload(
+            &json!({"prompt":"make a film","model":"sora-2","duration":8,"aspect_ratio":"16:9"}),
+            "sora-2",
+        )
+        .unwrap();
+        assert_eq!(sora["model"], "sora-2");
+        assert_eq!(sora["seconds"], 8);
+        assert!(callxyq_video_payload(&json!({"prompt":"x","duration":3}), "sora-2").is_err());
+        let veo = callxyq_video_payload(
+            &json!({"prompt":"make a film","aspect_ratio":"9:16","resolution":"1080p"}),
+            "gemini-veo-3-8s",
+        )
+        .unwrap();
+        assert_eq!(veo["size"], "1080x1920");
+        assert!(callxyq_video_payload(
+            &json!({"prompt":"x","content":[{"type":"video_url","video_url":"https://x"}]}),
+            "gemini-veo-3-8s"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn callxyq_response_normalization_matches_unified_video_shape() {
+        let created = normalize_callxyq_video_response(
+            &Method::POST,
+            "sora-2",
+            &json!({"task_id":"t1","status":"queued"}),
+            Some(12),
+        );
+        assert_eq!(created["id"], "t1");
+        assert_eq!(created["status"], "queued");
+        let completed = normalize_callxyq_video_response(
+            &Method::GET,
+            "sora-2",
+            &json!({"id":"t1","status":"completed","video_url":"https://cdn/video.mp4","size":"1280x720"}),
+            Some(12),
+        );
+        assert_eq!(completed["status"], "succeeded");
+        assert_eq!(completed["video"]["url"], "https://cdn/video.mp4");
+        assert_eq!(completed["usage"]["video_tokens"], 12);
     }
 
     #[test]
