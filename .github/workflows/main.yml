@@ -58,7 +58,7 @@ jobs:
           IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
           PATCH=$((VERSION_PARTS[2] + 1))
           NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
-          sed -i "s/^version = .*/version = "$NEW_VERSION"/" rust/uni-api-native/Cargo.toml
+          sed -i 's/^version = .*/version = "'$NEW_VERSION'"/' rust/uni-api-native/Cargo.toml
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
