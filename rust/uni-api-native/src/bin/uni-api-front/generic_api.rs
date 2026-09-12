@@ -5656,6 +5656,20 @@ fn callxyq_video_payload(input: &Value, model: &str) -> Result<Value, String> {
                     ));
                 }
             }
+            for i in 1..=videos.len() {
+                if !prompt.contains(&format!("@Video{i}")) {
+                    return Err(format!(
+                        "callxyq Sora multi-resource prompts must reference @Video{i}"
+                    ));
+                }
+            }
+            for i in 1..=audios.len() {
+                if !prompt.contains(&format!("@Audio{i}")) {
+                    return Err(format!(
+                        "callxyq Sora audio prompts must reference @Audio{i}"
+                    ));
+                }
+            }
         }
         payload.insert("aspect_ratio".into(), json!(ratio));
         payload.insert("resolution".into(), json!(resolution));
@@ -5709,6 +5723,20 @@ fn callxyq_video_payload(input: &Value, model: &str) -> Result<Value, String> {
             return Err("callxyq Veo models do not support video or audio resources".into());
         }
         let max_images = if model.contains("-ref-") { 3 } else { 2 };
+        if let Some(encoded) = model
+            .rsplit_once('-')
+            .and_then(|(_, suffix)| suffix.strip_suffix('s'))
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            if let Some(requested) = get("duration")
+                .or_else(|| get("seconds"))
+                .and_then(Value::as_i64)
+            {
+                if requested != encoded {
+                    return Err(format!("Veo duration is encoded in model name ({encoded}s); request duration {requested}s does not match"));
+                }
+            }
+        }
         if images.len() > max_images {
             return Err("callxyq Veo image reference limit exceeded".into());
         }
