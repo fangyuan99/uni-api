@@ -2294,7 +2294,7 @@ fn build_attempt(
         {
             payload = callxyq_video_payload(&payload, original_model)?;
             (
-                callxyq_video_url(provider.base_url.as_ref(), None)?,
+                callxyq_video_url(provider, None, true)?,
                 ResponseAdapter::CallxyqVideo,
                 false,
             )
@@ -2308,7 +2308,7 @@ fn build_attempt(
         {
             let task_id = path.trim_start_matches("/v1/video/tasks/");
             (
-                callxyq_video_url(provider.base_url.as_ref(), Some(task_id))?,
+                callxyq_video_url(provider, Some(task_id), false)?,
                 ResponseAdapter::CallxyqVideo,
                 false,
             )
@@ -5535,11 +5535,33 @@ fn service_account_jwt(email: &str, private_key: &str) -> Result<String, String>
     ))
 }
 
-fn callxyq_video_url(base: &str, task_id: Option<&str>) -> Result<String, String> {
-    let root = base.trim_end_matches('/');
-    let path = task_id
-        .map(|id| format!("/v1/videos/{}", id.replace('/', "%2F")))
-        .unwrap_or_else(|| "/v1/videos".into());
+fn callxyq_video_url(
+    provider: &Provider,
+    task_id: Option<&str>,
+    create: bool,
+) -> Result<String, String> {
+    let root = provider.base_url.trim_end_matches('/');
+    let route_name = if create { "create_task" } else { "get_task" };
+    let configured = provider
+        .preferences
+        .get("video_routes")
+        .and_then(|v| v.get(route_name));
+    let mut path = configured
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if create {
+                "/v1/videos".into()
+            } else {
+                "/v1/videos/{task_id}".into()
+            }
+        });
+    if let Some(id) = task_id {
+        path = path.replace("{task_id}", &id.replace('/', "%2F"));
+    }
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
     Ok(format!("{root}{path}"))
 }
 
