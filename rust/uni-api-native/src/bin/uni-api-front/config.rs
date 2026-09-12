@@ -545,7 +545,7 @@ pub fn compile_snapshot_bytes(raw: &[u8], database_disabled: bool) -> Result<Vec
         .as_object()
         .ok_or_else(|| "uni-api configuration must be a mapping".to_owned())?;
 
-    let providers = root
+    let mut providers = root
         .get("providers")
         .and_then(Value::as_array)
         .map(|items| {
@@ -555,6 +555,24 @@ pub fn compile_snapshot_bytes(raw: &[u8], database_disabled: bool) -> Result<Vec
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // Video providers use a dedicated schema in Python. Compile them into the
+    // same immutable provider graph so every Rust endpoint can route them.
+    if let Some(video) = root.get("video_providers").and_then(Value::as_array) {
+        for item in video {
+            if let Some(mut provider) = compile_video_provider(item) {
+                let name = provider
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !providers
+                    .iter()
+                    .any(|p| p.get("name").and_then(Value::as_str) == Some(name))
+                {
+                    providers.push(provider.take());
+                }
+            }
+        }
+    }
     let mut api_keys = root
         .get("api_keys")
         .and_then(Value::as_array)
@@ -598,6 +616,69 @@ pub fn compile_snapshot_bytes(raw: &[u8], database_disabled: bool) -> Result<Vec
         .map_err(|error| format!("encode compiled runtime configuration: {error}"))
 }
 
+fn compile_video_provider(value: &Value) -> Option<Value> {
+    let item = value.as_object()?;
+    let name = item
+        .get("name")
+        .or_else(|| item.get("provider"))
+        .and_then(Value::as_str)?
+        .trim();
+    let base_url = item
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if name.is_empty() || base_url.is_empty() {
+        return None;
+    }
+    let models = item
+        .get("models")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .map(|(request, cfg)| {
+                    let upstream = cfg
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            cfg.get("upstream_model")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| request.clone());
+                    (request.clone(), upstream)
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    if models.is_empty() {
+        return None;
+    }
+    let mut preferences = item
+        .get("preferences")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(routes) = item.get("routes") {
+        preferences.insert("video_routes".into(), routes.clone());
+    }
+    preferences.insert(
+        "video_adapter".into(),
+        item.get("adapter")
+            .cloned()
+            .unwrap_or_else(|| json!("http_json")),
+    );
+    let api = item
+        .get("auth")
+        .and_then(|a| a.get("api_key"))
+        .cloned()
+        .or_else(|| item.get("api").cloned())
+        .unwrap_or(Value::Null);
+    Some(
+        json!({"name":name,"base_url":base_url,"engine":item.get("adapter").and_then(Value::as_str).unwrap_or("video"),"api":api,"models":models,"model_order":models.keys().collect::<Vec<_>>(),"preferences":preferences,"exclude_endpoints":[],"only_request_types":null,"exclude_request_types":null,"exclude_request_rules":[]}),
+    )
+}
+
 fn compile_provider(value: &Value) -> Option<Value> {
     let item = value.as_object()?;
     let name = scalar_string(item.get("provider")?).trim().to_owned();
@@ -621,6 +702,26 @@ fn compile_provider(value: &Value) -> Option<Value> {
     if !preferences.contains_key("max_request_body_bytes") {
         if let Some(limit) = item.get("max_request_body_bytes") {
             preferences.insert("max_request_body_bytes".into(), limit.clone());
+        }
+    }
+    // Preserve provider fields consumed by Python adapters. Keeping these in
+    // the immutable preferences map makes the Rust snapshot forward compatible
+    // without dropping unknown provider options during compilation.
+    for field in [
+        "tools",
+        "image",
+        "video_route",
+        "video_model",
+        "video_provider",
+        "api_key_rate_limit",
+        "api_key_schedule_algorithm",
+        "AUTO_RETRY",
+        "project_id",
+        "private_key",
+        "client_email",
+    ] {
+        if let Some(value) = item.get(field) {
+            preferences.insert(field.to_owned(), value.clone());
         }
     }
     let engine = item
@@ -699,6 +800,18 @@ fn infer_engine(base_url: &str) -> String {
     }
     if lower.contains("api.cohere.com") {
         return "cohere".into();
+    }
+    if lower.contains("volces.com/api/v3") || lower.contains("doubao") {
+        return "doubao-translation".into();
+    }
+    if lower.contains("azure.com") {
+        return "azure".into();
+    }
+    if lower.contains("databricks") {
+        return "azure-databricks".into();
+    }
+    if lower.contains("cloudflare") || lower.contains("workers.dev") {
+        return "cloudflare".into();
     }
     "gpt".into()
 }
@@ -849,11 +962,15 @@ fn compile_api_key(value: &Value, _database_disabled: bool) -> Option<Value> {
     if model_rules.is_empty() {
         model_rules.push(Value::String("all".into()));
     }
-    let preferences = item
+    let mut preferences = item
         .get("preferences")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // Keep the original rules as a route graph. The flattened model_rules
+    // remain useful for fast matching, while this metadata lets the native
+    // router traverse parent/child key boundaries without inventing channels.
+    preferences.insert("__route_graph".into(), Value::Array(model_rules.clone()));
     Some(json!({
         "token": token,
         "model_rules": model_rules,
@@ -1003,6 +1120,53 @@ api_keys:
         assert_eq!(value["providers"][0]["model_order"][0], "gpt-5.6-sol");
         assert_eq!(value["api_keys"][0]["native_paid_state_safe"], true);
         assert_eq!(value["revision"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn preserves_provider_capabilities_and_video_provider_routes() {
+        let raw = br#"
+providers:
+  - provider: p
+    base_url: https://example.com/v1/chat/completions
+    api: upstream
+    model: [m]
+    tools: true
+    image: false
+    preferences:
+      api_key_schedule_algorithm: smart_round_robin
+video_providers:
+  - name: callxyq
+    adapter: callxyq
+    base_url: https://api.callxyq.xyz
+    models:
+      sora-2: sora-2
+    routes:
+      create_task: /v1/videos
+api_keys:
+  - api: parent
+    model: [child/*]
+  - api: child
+    model: [callxyq/sora-2]
+"#;
+        let value: Value =
+            serde_json::from_slice(&compile_snapshot_bytes(raw, true).unwrap()).unwrap();
+        let p = value["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "p")
+            .unwrap();
+        assert_eq!(p["preferences"]["tools"], true);
+        assert_eq!(p["preferences"]["image"], false);
+        assert!(value["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["name"] == "callxyq"));
+        assert_eq!(
+            value["api_keys"][0]["preferences"]["__route_graph"][0],
+            "child/*"
+        );
     }
 
     #[test]

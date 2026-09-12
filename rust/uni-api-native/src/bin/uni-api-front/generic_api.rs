@@ -271,9 +271,17 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             );
         }
     }
-    let max_attempts = compute_retry_count(&resolved.providers)
-        .max(resolved.providers.len())
-        .min(10);
+    let retry_budget = state
+        .native_responses_config
+        .auto_retry_budget(&headers)
+        .await;
+    let max_attempts = if retry_budget == 0 {
+        1
+    } else {
+        compute_retry_count(&resolved.providers)
+            .max(resolved.providers.len().saturating_add(retry_budget))
+            .min(100)
+    };
     let hedging = resolved.hedging;
     let auto_retry = state
         .native_responses_config
@@ -637,35 +645,32 @@ fn emit_routing_skip(
     original_model: &str,
     skip_reason: &str,
 ) {
-    eprintln!(
-        "{}",
-        json!({
-            "kind": "log",
-            "fugue_table": "app_events",
-            "event": "routing_attempt",
-            "event_type": "routing_attempt",
-            "severity": "info",
-            "source": "uni-api-ember",
-            "message": "uni-api-ember generic routing attempt",
-            "request_id": execution.request_id,
-            "trace_id": execution.trace_id,
-            "path": execution.path,
-            "path_template": execution.path,
-            "route": format!("{} {}", execution.method, execution.path),
-            "method": execution.method.as_str(),
-            "model": execution.request_model,
-            "provider": provider.name.as_ref(),
-            "channel": provider.name.as_ref(),
-            "role": execution.api_key_role,
-            "actual_model": original_model,
-            "attempt_id": format!("{}-r{}", execution.request_id, attempt_index + 1),
-            "attempt_index": attempt_index + 1,
-            "attempt_outcome": "skipped",
-            "skip_reason": skip_reason,
-            "streaming": false,
-            "rust_generic_data_plane": true,
-        })
-    );
+    crate::telemetry::emit(json!({
+        "kind": "log",
+        "fugue_table": "app_events",
+        "event": "routing_attempt",
+        "event_type": "routing_attempt",
+        "severity": "info",
+        "source": "uni-api-ember",
+        "message": "uni-api-ember generic routing attempt",
+        "request_id": execution.request_id,
+        "trace_id": execution.trace_id,
+        "path": execution.path,
+        "path_template": execution.path,
+        "route": format!("{} {}", execution.method, execution.path),
+        "method": execution.method.as_str(),
+        "model": execution.request_model,
+        "provider": provider.name.as_ref(),
+        "channel": provider.name.as_ref(),
+        "role": execution.api_key_role,
+        "actual_model": original_model,
+        "attempt_id": format!("{}-r{}", execution.request_id, attempt_index + 1),
+        "attempt_index": attempt_index + 1,
+        "attempt_outcome": "skipped",
+        "skip_reason": skip_reason,
+        "streaming": false,
+        "rust_generic_data_plane": true,
+    }));
 }
 
 fn spawn_generic_hedge_attempt(
@@ -2277,6 +2282,34 @@ fn build_attempt(
                 messages_url(provider.base_url.as_ref()),
                 ResponseAdapter::Passthrough,
                 provider_stream,
+            )
+        }
+        _ if path == "/v1/video/tasks"
+            && (provider.name.eq_ignore_ascii_case("callxyq")
+                || provider
+                    .base_url
+                    .to_ascii_lowercase()
+                    .contains("callxyq.xyz")) =>
+        {
+            payload = callxyq_video_payload(&payload, original_model)?;
+            (
+                callxyq_video_url(provider.base_url.as_ref(), None)?,
+                ResponseAdapter::Passthrough,
+                false,
+            )
+        }
+        _ if path.starts_with("/v1/video/tasks/")
+            && (provider.name.eq_ignore_ascii_case("callxyq")
+                || provider
+                    .base_url
+                    .to_ascii_lowercase()
+                    .contains("callxyq.xyz")) =>
+        {
+            let task_id = path.trim_start_matches("/v1/video/tasks/");
+            (
+                callxyq_video_url(provider.base_url.as_ref(), Some(task_id))?,
+                ResponseAdapter::Passthrough,
+                false,
             )
         }
         "lingjing" if path == "/v1/video/tasks" => {
@@ -5488,6 +5521,55 @@ fn service_account_jwt(email: &str, private_key: &str) -> Result<String, String>
     ))
 }
 
+fn callxyq_video_url(base: &str, task_id: Option<&str>) -> Result<String, String> {
+    let root = base.trim_end_matches('/');
+    let path = task_id
+        .map(|id| format!("/v1/videos/{}", id.replace('/', "%2F")))
+        .unwrap_or_else(|| "/v1/videos".into());
+    Ok(format!("{root}{path}"))
+}
+
+fn callxyq_video_payload(input: &Value, model: &str) -> Result<Value, String> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| "video task request body must be an object".to_owned())?;
+    let prompt = object
+        .get("prompt")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("content").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "callxyq video requests require prompt".to_owned())?;
+    let mut payload = Map::new();
+    payload.insert("model".into(), Value::String(model.to_owned()));
+    payload.insert("prompt".into(), Value::String(prompt.to_owned()));
+    for key in [
+        "size",
+        "seconds",
+        "duration",
+        "aspect_ratio",
+        "resolution",
+        "negative_prompt",
+        "generate_audio",
+        "image_url",
+        "reference_image_urls",
+        "reference_video",
+        "reference_videos",
+        "audio_url",
+        "video_config",
+    ] {
+        if let Some(value) = object.get(key) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    if !payload.contains_key("seconds") {
+        if let Some(value) = object.get("duration") {
+            payload.insert("seconds".into(), value.clone());
+        }
+    }
+    Ok(Value::Object(payload))
+}
+
 fn video_tasks_url(base: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/contents/generations/tasks") {
@@ -6034,9 +6116,7 @@ fn emit_attempt(
         "failed" | "cancelled" => Some(false),
         _ => None,
     };
-    eprintln!(
-        "{}",
-        json!({
+    crate::telemetry::emit(json!({
             "kind": "log",
             "fugue_table": "app_events",
             "event": event,
@@ -6065,8 +6145,8 @@ fn emit_attempt(
             "outcome": outcome,
             "status_code": status,
             "rust_generic_data_plane": true,
-        })
-    );
+        }
+    ));
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Body> {

@@ -53,6 +53,7 @@ pub struct NativeConfigStore {
     channel_cooldowns: Arc<Mutex<HashMap<(String, String), tokio::time::Instant>>>,
     route_failures: Arc<Mutex<RouteFailureHistory>>,
     client_windows: Arc<Mutex<RateWindows>>,
+    provider_windows: Arc<Mutex<RateWindows>>,
     routing_cursors: Arc<Mutex<HashMap<(String, String), usize>>>,
 }
 
@@ -300,6 +301,7 @@ impl NativeConfigStore {
             channel_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             route_failures: Arc::new(Mutex::new(HashMap::new())),
             client_windows: Arc::new(Mutex::new(HashMap::new())),
+            provider_windows: Arc::new(Mutex::new(HashMap::new())),
             routing_cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -597,18 +599,33 @@ impl NativeConfigStore {
     }
 
     pub(crate) async fn auto_retry_enabled(&self, headers: &HeaderMap) -> bool {
+        self.auto_retry_budget(headers).await > 0
+    }
+
+    pub(crate) async fn auto_retry_budget(&self, headers: &HeaderMap) -> usize {
         let Some(snapshot) = self.snapshot().await else {
-            return true;
+            return 1;
         };
         let Some(token) = extract_api_key(headers) else {
-            return true;
+            return 1;
         };
-        snapshot
+        let Some(value) = snapshot
             .api_keys
             .get(&token)
-            .and_then(|api_key| api_key.preferences.get("AUTO_RETRY"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+            .and_then(|key| key.preferences.get("AUTO_RETRY"))
+        else {
+            return 1;
+        };
+        match value {
+            Value::Bool(enabled) => usize::from(*enabled),
+            Value::Number(number) => number.as_u64().unwrap_or(0).min(100) as usize,
+            Value::String(text) => text
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| usize::from(pydantic_bool(value).unwrap_or(true)))
+                .min(100),
+            _ => 1,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -743,6 +760,13 @@ impl NativeConfigStore {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     message: "Invalid client rate-limit configuration".into(),
                 })?;
+        let estimated_tokens = (request_body_bytes / 4).max(1) as usize;
+        if tpr_exceeded(&client_rules, estimated_tokens) {
+            return Err(RouteResolutionError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "Tokens per request limit exceeded".into(),
+            });
+        }
         if admit_rate
             && (!self.admit_rate("__global__", &global_rules).await
                 || !self
@@ -885,16 +909,48 @@ impl NativeConfigStore {
         {
             return ProviderKeySelection::ChannelCooling;
         }
+        let algorithm = provider
+            .preferences
+            .get("api_key_schedule_algorithm")
+            .or_else(|| provider.preferences.get("API_KEY_SCHEDULE_ALGORITHM"))
+            .and_then(Value::as_str)
+            .unwrap_or("round_robin")
+            .trim()
+            .to_ascii_lowercase();
         let cooldowns = self.key_cooldowns.lock().await;
-        for _ in 0..provider.api_keys.len() {
-            let index = provider.cursor.fetch_add(1, Ordering::Relaxed) % provider.api_keys.len();
+        let mut candidates = (0..provider.api_keys.len()).collect::<Vec<_>>();
+        if algorithm == "fixed_priority" || algorithm == "priority" {
+            // preserve configured order
+        } else if algorithm == "random" || algorithm == "lottery" {
+            shuffle_indices(
+                &mut candidates,
+                scheduling_seed(provider.name.as_ref(), original_model),
+            );
+        } else {
+            let start = provider.cursor.fetch_add(1, Ordering::Relaxed) % provider.api_keys.len();
+            candidates.rotate_left(start);
+        }
+        drop(cooldowns);
+        for index in candidates {
             let key = provider.api_keys[index].clone();
-            if cooldowns
+            let cooling = self
+                .key_cooldowns
+                .lock()
+                .await
                 .get(&(provider.name.to_string(), key.clone()))
-                .is_none_or(|until| *until <= now)
-            {
-                return ProviderKeySelection::Selected(key);
+                .is_some_and(|until| *until > now);
+            if cooling {
+                continue;
             }
+            if let Some(rules) = parse_rate_limits(
+                provider.preferences.get("api_key_rate_limit"),
+                Some(original_model),
+            ) {
+                if !self.admit_provider_rate(provider, &key, &rules).await {
+                    continue;
+                }
+            }
+            return ProviderKeySelection::Selected(key);
         }
         ProviderKeySelection::AllKeysCooling
     }
@@ -984,6 +1040,42 @@ impl NativeConfigStore {
         }
     }
 
+    async fn admit_provider_rate(
+        &self,
+        provider: &Provider,
+        key: &str,
+        rules: &[(usize, u64)],
+    ) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut buckets = self.provider_windows.lock().await;
+        for (limit, seconds) in rules {
+            if *seconds == 0 {
+                continue;
+            }
+            let bucket = format!("provider:{}:{}", provider.name, key);
+            let queue = buckets.entry((bucket, *seconds)).or_default();
+            let window = Duration::from_secs(*seconds);
+            while queue
+                .front()
+                .is_some_and(|started| now.duration_since(*started) >= window)
+            {
+                queue.pop_front();
+            }
+            if queue.len() >= *limit {
+                return false;
+            }
+        }
+        for (_, seconds) in rules {
+            if *seconds > 0 {
+                buckets
+                    .entry((format!("provider:{}:{}", provider.name, key), *seconds))
+                    .or_default()
+                    .push_back(now);
+            }
+        }
+        true
+    }
+
     pub(crate) async fn reset_route_failure(&self, provider: &Provider, original_model: &str) {
         self.route_failures
             .lock()
@@ -995,6 +1087,9 @@ impl NativeConfigStore {
         let now = tokio::time::Instant::now();
         let mut buckets = self.client_windows.lock().await;
         for (limit, seconds) in rules {
+            if *seconds == 0 {
+                continue;
+            }
             let queue = buckets.entry((bucket.to_owned(), *seconds)).or_default();
             let window = Duration::from_secs(*seconds);
             while queue
@@ -1008,6 +1103,9 @@ impl NativeConfigStore {
             }
         }
         for (_, seconds) in rules {
+            if *seconds == 0 {
+                continue;
+            }
             buckets
                 .entry((bucket.to_owned(), *seconds))
                 .or_default()
@@ -1662,7 +1760,12 @@ impl NativeRoute {
         self.api_key
             .preferences
             .get("AUTO_RETRY")
-            .and_then(Value::as_bool)
+            .map(|value| match value {
+                Value::Bool(enabled) => *enabled,
+                Value::Number(number) => number.as_u64().unwrap_or(0) > 0,
+                Value::String(text) => text.trim().parse::<usize>().map(|n| n > 0).unwrap_or(true),
+                _ => true,
+            })
             .unwrap_or(true)
     }
 
@@ -2040,6 +2143,15 @@ pub async fn prepare_native_request(
     else {
         return NativePreparation::Fallback;
     };
+    if tpr_exceeded(
+        &client_rate_rules,
+        (observation.body_bytes / 4).max(1) as usize,
+    ) {
+        return NativePreparation::Response(json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error":"Tokens per request limit exceeded"}),
+        ));
+    }
     // Admit only after the request is proven native-safe. A compatibility
     // fallback must not consume both the Rust and Python rate-limit buckets.
     if !store.admit_rate("__global__", &global_rate_rules).await {
@@ -2081,7 +2193,9 @@ pub async fn prepare_native_request(
             json!({"error": "Too many requests"}),
         ));
     }
-    let retry_count = compute_retry_count(&providers);
+    let retry_count = compute_retry_count(&providers)
+        .max(api_key_retry_budget(&api_key, providers.len()))
+        .min(100);
     NativePreparation::Ready(NativeRoute {
         store: store.clone(),
         codex_oauth,
@@ -2134,55 +2248,68 @@ fn matching_providers(
     reasoning_effort: Option<&str>,
     endpoint: &str,
 ) -> Result<Vec<Arc<Provider>>, ()> {
-    let mut matches = Vec::new();
-    for rule in api_key.model_rules.iter() {
-        if rule == "all" {
-            matches.extend(
-                snapshot
-                    .providers
-                    .iter()
-                    .filter(|provider| provider.models.contains_key(request_model))
-                    .cloned(),
-            );
-            continue;
+    // Walk the key graph recursively. A child key contributes only the model
+    // rules it explicitly owns; its token is never turned into a synthetic
+    // upstream channel, so parent and child policy boundaries stay visible to
+    // scheduling and accounting.
+    fn collect(
+        snapshot: &Snapshot,
+        key: &ApiKey,
+        model: &str,
+        out: &mut Vec<Arc<Provider>>,
+        visiting: &mut std::collections::BTreeSet<String>,
+    ) {
+        if !visiting.insert(key.token.to_string()) {
+            return;
         }
-        if rule.starts_with('<') && rule.ends_with('>') {
-            if &rule[1..rule.len() - 1] == request_model {
-                matches.extend(
-                    snapshot
-                        .providers
-                        .iter()
-                        .filter(|provider| provider.models.contains_key(request_model))
-                        .cloned(),
-                );
-            }
-            continue;
-        }
-        if let Some((provider_name, model_rule)) = rule.split_once('/') {
-            let Some(provider) = snapshot.providers_by_name.get(provider_name) else {
-                // Nested API-key providers remain on the Python compatibility path.
-                if snapshot.api_keys.contains_key(provider_name) {
-                    return Err(());
+        let rules = key
+            .preferences
+            .get("__route_graph")
+            .and_then(Value::as_array)
+            .map(|v| v.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_else(|| key.model_rules.iter().map(String::as_str).collect());
+        for rule in rules {
+            let Some((alias, requested)) = rule.split_once('/') else {
+                if rule == "all"
+                    || rule == model
+                    || (rule.starts_with('<')
+                        && rule.ends_with('>')
+                        && &rule[1..rule.len() - 1] == model)
+                {
+                    out.extend(
+                        snapshot
+                            .providers
+                            .iter()
+                            .filter(|p| p.models.contains_key(model))
+                            .cloned(),
+                    );
                 }
                 continue;
             };
-            if (model_rule == "*" || model_rule == request_model)
-                && provider.models.contains_key(request_model)
-            {
-                matches.push(provider.clone());
+            if let Some(child) = snapshot.api_keys.get(alias) {
+                if requested == "*" || requested == model {
+                    collect(snapshot, child, model, out, visiting);
+                }
+                continue;
             }
-            continue;
+            if let Some(provider) = snapshot.providers_by_name.get(alias) {
+                if (requested == "*" || requested == model) && provider.models.contains_key(model) {
+                    out.push(provider.clone());
+                }
+            }
         }
-        if rule == request_model {
-            matches.extend(
-                snapshot
-                    .providers
-                    .iter()
-                    .filter(|provider| provider.models.contains_key(request_model))
-                    .cloned(),
-            );
-        }
+        visiting.remove(key.token.as_ref());
     }
+    let mut matches = Vec::new();
+    collect(
+        snapshot,
+        api_key,
+        request_model,
+        &mut matches,
+        &mut std::collections::BTreeSet::new(),
+    );
+    matches.sort_by(|a, b| a.name.cmp(&b.name));
+    matches.dedup_by(|a, b| a.name == b.name);
     matches.retain(|provider| {
         !provider.excluded_endpoints.iter().any(|excluded| {
             excluded
@@ -2301,6 +2428,13 @@ fn lottery_sequence(weighted: &[(Arc<Provider>, usize)], mut seed: u64) -> Vec<A
     sequence
 }
 
+fn shuffle_indices(indices: &mut [usize], mut seed: u64) {
+    for index in (1..indices.len()).rev() {
+        seed = xorshift(seed);
+        indices.swap(index, seed as usize % (index + 1));
+    }
+}
+
 fn shuffle_providers(providers: &mut [Arc<Provider>], mut seed: u64) {
     for index in (1..providers.len()).rev() {
         seed = xorshift(seed);
@@ -2383,6 +2517,20 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let doy = (153 * month_prime + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+fn api_key_retry_budget(api_key: &ApiKey, provider_count: usize) -> usize {
+    let configured = api_key
+        .preferences
+        .get("AUTO_RETRY")
+        .map(|value| match value {
+            Value::Bool(enabled) => usize::from(*enabled),
+            Value::Number(number) => number.as_u64().unwrap_or(0) as usize,
+            Value::String(text) => text.trim().parse::<usize>().unwrap_or(1),
+            _ => 1,
+        })
+        .unwrap_or(1);
+    provider_count.saturating_add(configured)
 }
 
 pub(crate) fn compute_retry_count(providers: &[Arc<Provider>]) -> usize {
@@ -3470,6 +3618,12 @@ fn retry_after_seconds(detail: &str) -> Option<f64> {
     )
 }
 
+fn tpr_exceeded(rules: &[(usize, u64)], estimated_tokens: usize) -> bool {
+    rules
+        .iter()
+        .any(|(limit, seconds)| *seconds == 0 && estimated_tokens > *limit)
+}
+
 fn parse_rate_limits(value: Option<&Value>, model: Option<&str>) -> Option<Vec<(usize, u64)>> {
     let raw = match value {
         None | Some(Value::Null) => "999999/min",
@@ -3511,7 +3665,7 @@ fn parse_rate_limits(value: Option<&Value>, model: Option<&str>) -> Option<Vec<(
             "d" | "day" => 86_400,
             "mo" | "month" => 2_592_000,
             "y" | "year" => 31_536_000,
-            "tpr" => continue,
+            "tpr" => 0,
             _ => return None,
         };
         rules.push((count, seconds));
@@ -3912,6 +4066,32 @@ mod tests {
             }]),
         );
         assert_eq!(root["tools"], json!([{"type":"function","name":"ok"}]));
+    }
+
+    #[test]
+    fn shared_python_rust_contract_fixture_covers_routes_and_provider_fields() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../../test/runtime_contracts.fixture"
+        ))
+        .unwrap();
+        assert!(fixture["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "/v1/video/tasks"));
+        assert!(fixture["provider_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "tools"));
+        assert_eq!(fixture["nested_key"]["rule"], "child-key/*");
+    }
+
+    #[test]
+    fn tpr_rate_limits_are_preserved_as_request_token_rules() {
+        let rules = parse_rate_limits(Some(&json!("2/tpr, 10/min")), Some("m")).unwrap();
+        assert!(rules.contains(&(2, 0)));
+        assert!(rules.contains(&(10, 60)));
     }
 
     #[test]

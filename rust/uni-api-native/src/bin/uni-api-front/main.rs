@@ -14,6 +14,7 @@ mod resources;
 mod responses;
 mod responses_item_ids;
 mod responses_native;
+mod telemetry;
 
 use std::future::IntoFuture;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
